@@ -9,11 +9,15 @@ async function waitVisible(page, selector, timeout = 30000) {
 }
 
 async function clickIfExists(page, selector) {
-  const el = await page.$(selector);
-  if (!el) return false;
-  await el.evaluate((n) => n.scrollIntoView({ block: "center" }));
-  await el.click();
-  return true;
+  try {
+    const el = await page.$(selector);
+    if (!el) return false;
+    await el.evaluate((n) => n.scrollIntoView({ block: "center" }));
+    await el.click();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function clickByText(page, selectors, text) {
@@ -32,7 +36,6 @@ async function clickByText(page, selectors, text) {
 }
 
 async function ensureLoggedIn(page) {
-  // if already logged in, avatar exists
   const avatar = await page.$(".avatar.circle, img.avatar");
   if (avatar) return;
 
@@ -46,11 +49,12 @@ async function ensureLoggedIn(page) {
     page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {}),
   ]);
 
-  // If GitHub asks for 2FA, let you do it manually.
-  // We just wait until we see an avatar somewhere after you finish.
   for (let i = 0; i < 120; i++) {
     const ok = await page.$(".avatar.circle, img.avatar");
-    if (ok) return;
+    if (ok) {
+      console.log("Logged in successfully.");
+      return;
+    }
     await sleep(500);
   }
 
@@ -58,38 +62,38 @@ async function ensureLoggedIn(page) {
 }
 
 async function ensureStarred(page) {
-  // Prefer the stable GitHub form actions (when present)
   const starFormBtn = 'form[action*="/star"] button';
   const unstarFormBtn = 'form[action*="/unstar"] button';
 
-  // Wait for *either* star/unstar UI to show up
   await page.waitForSelector(
     `${starFormBtn}, ${unstarFormBtn}, button[aria-label*="Star"], button[aria-label*="Unstar"]`,
     { timeout: 30000 }
   );
 
-  // Already starred?
-  if (await page.$(unstarFormBtn)) return;
+  if (await page.$(unstarFormBtn)) {
+    console.log("  Already starred.");
+    return;
+  }
 
-  // Click the "Star" button (form-based)
   const starBtn = await page.$(starFormBtn);
   if (starBtn) {
     await starBtn.evaluate((n) => n.scrollIntoView({ block: "center" }));
     await starBtn.click();
-    // wait until it becomes unstar
     await page.waitForSelector(unstarFormBtn, { timeout: 30000 });
+    console.log("  Starred via form button.");
     return;
   }
 
-  // Fallback: aria-label buttons
-  // Find a button that stars (not unstars)
   const ariaButtons = await page.$$(
     'button[aria-label*="Star"], button[aria-label*="Unstar"]'
   );
 
   for (const b of ariaButtons) {
     const label = await b.evaluate((n) => n.getAttribute("aria-label") || "");
-    if (label.toLowerCase().includes("unstar")) return; // already starred
+    if (label.toLowerCase().includes("unstar")) {
+      console.log("  Already starred (aria).");
+      return;
+    }
   }
 
   for (const b of ariaButtons) {
@@ -97,20 +101,21 @@ async function ensureStarred(page) {
     if (label.toLowerCase().includes("star")) {
       await b.evaluate((n) => n.scrollIntoView({ block: "center" }));
       await b.click();
-      // give GitHub time to process
       await sleep(800);
+      console.log("  Starred via aria button.");
       return;
     }
   }
+
+  throw new Error("Could not find a Star button on this page.");
 }
 
-async function gotoStarsAndLists(page) {
-  // Don’t hardcode /stars/<user>/lists — GitHub can 404 that route.
+// Creates the list if it doesn't exist. Does NOT navigate into it.
+async function ensureListCreated(page, listName) {
   await page.goto("https://github.com/stars", { waitUntil: "domcontentloaded" });
-  await ensureLoggedIn(page);
+  await sleep(1000);
 
-  // Click the Lists link in the stars UI
-  // Try a few common hrefs GitHub uses.
+  // Try to get to the Lists tab
   const candidates = [
     'a[href="/stars?tab=lists"]',
     'a[href$="?tab=lists"]',
@@ -118,67 +123,58 @@ async function gotoStarsAndLists(page) {
     'a[data-ga-click*="Lists"]',
   ];
 
+  let onListsTab = false;
   for (const sel of candidates) {
     const ok = await clickIfExists(page, sel);
     if (ok) {
       await page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {});
-      return;
+      onListsTab = true;
+      console.log("Navigated to Lists tab.");
+      break;
     }
   }
 
-  // Fallback: click by text
-  const clicked = await clickByText(page, ["a", "button"], "Lists");
-  if (clicked) {
-    await page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {});
-    return;
+  if (!onListsTab) {
+    const clicked = await clickByText(page, ["a", "button"], "Lists");
+    if (clicked) {
+      await page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {});
+      console.log("Navigated to Lists tab (text fallback).");
+    } else {
+      throw new Error("Could not navigate to Lists tab.");
+    }
   }
 
-  // If this fails, GitHub UI changed; but the rest still can run (just list steps won’t).
-  throw new Error("Could not navigate to Lists from the Stars page.");
-}
-
-async function ensureListExists(page, listName) {
-  // We should be on the Lists page already.
   await sleep(500);
 
-  // If the list already exists, open it and return
-  const listLinks = await page.$$("a");
-  for (const a of listLinks) {
+  // Check if the list already exists by scanning all link text
+  const allLinks = await page.$$("a");
+  for (const a of allLinks) {
     const t = await a.evaluate((n) => (n.textContent || "").trim());
     if (t === listName) {
-      await a.evaluate((n) => n.scrollIntoView({ block: "center" }));
-      await a.click();
-      await page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {});
+      console.log(`List "${listName}" already exists, skipping creation.`);
       return;
     }
   }
 
-  // Create list
-  // GitHub sometimes uses "Create list" as a button or link.
-  const createSelectors = [
-    'a[href*="lists/new"]',
-    'button:has-text("Create list")', // not supported in puppeteer, kept for clarity
-  ];
-
-  // Try link first
-  if (!(await clickIfExists(page, 'a[href*="lists/new"]'))) {
-    // Fallback by text
+  // Click "Create list"
+  const createdViaLink = await clickIfExists(page, 'a[href*="lists/new"]');
+  if (!createdViaLink) {
     const ok = await clickByText(page, ["a", "button"], "Create list");
     if (!ok) throw new Error('Could not find "Create list" control.');
   }
 
   await page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {});
 
-  // Fill name + submit
-  const nameSel =
-    (await page.$("#user_list_name")) ? "#user_list_name" : 'input[name="user_list[name]"]';
+  // Fill in the list name
+  const nameSel = (await page.$("#user_list_name"))
+    ? "#user_list_name"
+    : 'input[name="user_list[name]"]';
 
   await waitVisible(page, nameSel);
   await page.click(nameSel, { clickCount: 3 });
   await page.type(nameSel, listName, { delay: 20 });
 
   // Submit
-  // Try common submit buttons
   const submitSelectors = [
     'button[type="submit"]',
     'input[type="submit"]',
@@ -190,11 +186,7 @@ async function ensureListExists(page, listName) {
     const btns = await page.$$(sel);
     for (const btn of btns) {
       const text = await btn.evaluate((n) => (n.textContent || n.value || "").trim());
-      if (
-        text === "Create" ||
-        text === "Create list" ||
-        text.toLowerCase().includes("create")
-      ) {
+      if (text.toLowerCase().includes("create")) {
         await btn.evaluate((n) => n.scrollIntoView({ block: "center" }));
         await btn.click();
         submitted = true;
@@ -207,11 +199,14 @@ async function ensureListExists(page, listName) {
   if (!submitted) throw new Error("Could not submit list creation form.");
 
   await page.waitForNavigation({ waitUntil: "domcontentloaded" }).catch(() => {});
+  console.log(`List "${listName}" created.`);
 }
 
 async function addRepoToList(page, listName) {
-  // Must be on a repo page and starred.
-  // Open the star dropdown; GitHub uses details#star-button in many layouts.
+  // Must already be on the repo page and starred.
+  // Open the dropdown next to the Starred button.
+  await sleep(500);
+
   const dropdownSelectors = [
     "details#star-button > summary",
     'details[id="star-button"] > summary',
@@ -224,60 +219,75 @@ async function addRepoToList(page, listName) {
     const ok = await clickIfExists(page, sel);
     if (ok) {
       opened = true;
+      console.log(`  Opened dropdown via: ${sel}`);
       break;
     }
   }
 
   if (!opened) {
-    // Some layouts have a small caret next to "Starred"
     const caretClicked = await clickIfExists(page, 'button[aria-label*="Starred"]');
     if (!caretClicked) throw new Error("Could not open star/list dropdown on repo page.");
+    opened = true;
+    console.log("  Opened dropdown via Starred button.");
   }
 
-  await sleep(600);
+  // Give the dropdown time to render
+  await sleep(1500);
 
-  // Now find the list checkbox item
-  // GitHub usually renders list rows with .js-user-list-menu-form
-  await page.waitForSelector(".js-user-list-menu-form, details-menu", { timeout: 15000 }).catch(() => {});
+  // Wait for the list menu to appear
+  await page
+    .waitForSelector(".js-user-list-menu-form, details-menu, [data-target='user-list-channel.listForm']", { timeout: 15000 })
+    .catch(() => {
+      console.log("  Warning: could not confirm dropdown rendered, trying anyway...");
+    });
+
+  // Try the standard .js-user-list-menu-form rows first
   const rows = await page.$$(".js-user-list-menu-form");
+  console.log(`  Found ${rows.length} list rows in dropdown.`);
 
-  if (!rows.length) {
-    // Fallback: any label/row containing the list name
-    const any = await page.$$("label, div, form");
-    for (const el of any) {
-      const t = await el.evaluate((n) => (n.innerText || "").trim());
+  if (rows.length) {
+    for (const row of rows) {
+      const t = await row.evaluate((n) => (n.innerText || "").trim());
       if (t.includes(listName)) {
-        // try checkbox inside
-        const cb = await el.$('input[type="checkbox"]');
+        const cb = await row.$('input[type="checkbox"]');
         if (cb) {
           const checked = await cb.evaluate((n) => n.checked);
-          if (!checked) await cb.click();
+          if (!checked) {
+            await cb.click();
+            console.log(`  Added to "${listName}".`);
+          } else {
+            console.log(`  Already in "${listName}".`);
+          }
         } else {
-          await el.click();
+          await row.click();
+          console.log(`  Clicked row for "${listName}".`);
         }
-        await sleep(600);
+        await sleep(800);
         return;
       }
     }
-    throw new Error(`Could not find list "${listName}" in dropdown.`);
   }
 
-  for (const row of rows) {
-    const t = await row.evaluate((n) => (n.innerText || "").trim());
+  // Fallback: scan all labels and divs for the list name
+  const elements = await page.$$("label, li, div[role='menuitem']");
+  for (const el of elements) {
+    const t = await el.evaluate((n) => (n.innerText || "").trim());
     if (t.includes(listName)) {
-      const cb = await row.$('input[type="checkbox"]');
+      const cb = await el.$('input[type="checkbox"]');
       if (cb) {
         const checked = await cb.evaluate((n) => n.checked);
         if (!checked) await cb.click();
+        console.log(`  Added to "${listName}" (fallback label).`);
       } else {
-        await row.click();
+        await el.click();
+        console.log(`  Clicked element for "${listName}" (fallback).`);
       }
-      await sleep(600);
+      await sleep(800);
       return;
     }
   }
 
-  throw new Error(`List "${listName}" not found in dropdown rows.`);
+  throw new Error(`List "${listName}" not found in dropdown. Make sure the list was created and the repo is starred.`);
 }
 
 (async () => {
@@ -288,6 +298,7 @@ async function addRepoToList(page, listName) {
 
   const page = await browser.newPage();
 
+  console.log("Logging in...");
   await ensureLoggedIn(page);
 
   const repositories = [
@@ -296,33 +307,34 @@ async function addRepoToList(page, listName) {
     "puppeteer/puppeteer",
   ];
 
-  // Star all three
+  // Step 1: Star all three repositories
+  console.log("\nStarring repositories...");
   for (const repo of repositories) {
+    console.log(`  -> ${repo}`);
     await page.goto(`https://github.com/${repo}`, { waitUntil: "domcontentloaded" });
     await ensureStarred(page);
     await sleep(1200);
   }
 
-  // Go to Stars -> Lists via UI (avoids 404 routing issues)
-  await gotoStarsAndLists(page);
-
-  // Create/open "Node Libraries"
+  // Step 2: Create the list (navigate to stars/lists, create if needed)
   const listName = "Node Libraries";
-  await ensureListExists(page, listName);
+  console.log(`\nEnsuring list "${listName}" exists...`);
+  await ensureListCreated(page, listName);
 
-  // Add each repo to the list
+  // Step 3: Go to each repo and add it to the list via the star dropdown
+  console.log(`\nAdding repos to "${listName}"...`);
   for (const repo of repositories) {
+    console.log(`  -> ${repo}`);
     await page.goto(`https://github.com/${repo}`, { waitUntil: "domcontentloaded" });
-    await ensureStarred(page); // safety
+    await ensureStarred(page);
     await addRepoToList(page, listName);
     await sleep(1000);
   }
 
-  // Optional: keep browser open a bit so you can see results
-  await sleep(1500);
-
+  console.log("\nAll done!");
+  await sleep(2000);
   await browser.close();
 })().catch((err) => {
-  console.error(err);
+  console.error("Fatal error:", err.message);
   process.exit(1);
 });
